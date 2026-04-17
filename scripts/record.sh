@@ -46,19 +46,19 @@ cmd_start() {
   # Stale state from a crashed run: clean up before checking disk.
   clear_state
 
-  # Disk-full guard. df -m prints available MB in the 4th column (BSD & GNU agree here).
+  # Create dirs first so disk-full check can always find a valid path.
+  mkdir -p "$RECORDINGS_DIR" "$LOG_DIR"
+
+  # Disk-full guard. `|| true` prevents pipefail from killing the script.
   local avail_mb
-  avail_mb=$(df -m "$RECORDINGS_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+  avail_mb=$(df -m "$RECORDINGS_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)
   if [[ -z "$avail_mb" ]]; then
-    # Directory might not exist yet — check the parent.
-    avail_mb=$(df -m . | awk 'NR==2 {print $4}')
+    avail_mb=$(df -m . | awk 'NR==2 {print $4}' || true)
   fi
-  if (( avail_mb < DISK_SPACE_MIN_MB )); then
+  if [[ -n "$avail_mb" ]] && (( avail_mb < DISK_SPACE_MIN_MB )); then
     echo "record.sh: only ${avail_mb}MB free, need ${DISK_SPACE_MIN_MB}MB minimum" >&2
     exit 3
   fi
-
-  mkdir -p "$RECORDINGS_DIR" "$LOG_DIR"
 
   local ts filename logfile
   ts=$(date +%Y%m%d_%H%M%S)
