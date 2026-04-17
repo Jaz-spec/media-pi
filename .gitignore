@@ -1,0 +1,23 @@
+# Python (Phase 2+)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local config / secrets
+.env
+*.db
+config.local.*
+docs/
+
+# Recordings — never commit these; they go to Hetzner
+recordings/
+logs/
+*.mp4
+*.wav
+
+# Phase 1 mock-hetzner bind-mount data
+mock-hetzner-data/
+
+# OS
+.DS_Store

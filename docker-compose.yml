@@ -1,0 +1,25 @@
+services:
+  mock-hetzner:
+    image: linuxserver/openssh-server:latest
+    container_name: mock-hetzner
+    hostname: mock-hetzner
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - USER_NAME=fac
+      - PASSWORD_ACCESS=false
+      - SUDO_ACCESS=false
+      - PUBLIC_KEY_FILE=/keys/authorized_keys
+    volumes:
+      # Bind mount so uploaded files are inspectable from the Mac.
+      # Created on first `docker compose up`; gitignored.
+      - ./mock-hetzner-data:/recordings
+      # Dedicated pubkey for the mock — generated in Step 0.
+      - ~/.ssh/fac_mock_hetzner_ed25519.pub:/keys/authorized_keys:ro
+      # Custom init scripts (linuxserver s6-overlay convention).
+      # Installs rsync on boot so the mock mirrors real Hetzner Storage Box.
+      - ./mock-hetzner-init:/custom-cont-init.d:ro
+    ports:
+      - "2222:2222"
+    restart: unless-stopped
