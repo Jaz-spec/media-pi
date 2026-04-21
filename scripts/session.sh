@@ -20,7 +20,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 cd "$REPO_ROOT"
 
 RECORD="$SCRIPT_DIR/record.sh"
-UPLOAD="$SCRIPT_DIR/upload.sh"
+UPLOAD="$SCRIPT_DIR/upload-cdn.sh"
 
 finished=0
 
