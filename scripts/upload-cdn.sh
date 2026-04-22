@@ -92,11 +92,11 @@ REG=$(curl -fsS -X POST "$FAC_API_URL" \
     exit 4
   }
 
-# The GraphQL resolver returns { video_id, object_key, upload_url } inside
-# data.watch_ingest_register. Pull the three fields; bail if any are missing.
-UPLOAD_URL=$(echo "$REG" | jq -r '.data.watch_ingest_register.upload_url // empty')
-VIDEO_ID=$(echo "$REG"  | jq -r '.data.watch_ingest_register.video_id // empty')
-OBJECT_KEY=$(echo "$REG" | jq -r '.data.watch_ingest_register.object_key // empty')
+# The /g endpoint strips the GraphQL envelope (see fac-cra api/app.ts), so the
+# resolver's { video_id, object_key, upload_url } arrives at the top level.
+UPLOAD_URL=$(echo "$REG" | jq -r '.upload_url // empty')
+VIDEO_ID=$(echo "$REG"  | jq -r '.video_id // empty')
+OBJECT_KEY=$(echo "$REG" | jq -r '.object_key // empty')
 
 if [[ -z "$UPLOAD_URL" || -z "$VIDEO_ID" || -z "$OBJECT_KEY" ]]; then
   log "register: bad response — $REG"
@@ -146,14 +146,6 @@ CONFIRM=$(curl -fsS -X POST "$FAC_API_URL" \
     exit 5
   }
 
-# If the confirm resolver threw, GraphQL puts it in .errors but still 200s —
-# so we check both conditions before declaring success.
-if echo "$CONFIRM" | jq -e '.errors' >/dev/null; then
-  log "confirm: server returned errors — $CONFIRM"
-  echo "${FILE}.failed: confirm errors at $(date -u +%Y-%m-%dT%H:%M:%SZ) video_id=$VIDEO_ID object_key=$OBJECT_KEY" > "${FILE}.failed"
-  exit 5
-fi
-
-log "confirm: ok — deleting local $FILE"
+log "confirm: ok ($CONFIRM) — deleting local $FILE"
 rm -f "$FILE"
 log "done"
