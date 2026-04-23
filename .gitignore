@@ -7,8 +7,13 @@ venv/
 # Local config / secrets
 .env
 *.db
+*.db-wal
+*.db-shm
 config.local.*
 docs/
+
+# facpi Go build output
+/bin/
 
 # Recordings — never commit these; they go to Hetzner
 recordings/

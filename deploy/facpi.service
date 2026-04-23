@@ -1,0 +1,32 @@
+[Unit]
+Description=FAC Pi recording daemon (facpi)
+Documentation=https://github.com/foundersandcoders/media-pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Owned by the user who has video/audio group membership.
+# Adjust to jaz/pi/etc. to match your Pi.
+User=jaz
+Group=jaz
+WorkingDirectory=/home/jaz/media-pi
+EnvironmentFile=/home/jaz/media-pi/.env
+ExecStart=/home/jaz/media-pi/bin/facpi daemon
+
+Restart=on-failure
+RestartSec=5
+
+# Log straight to a file in the repo (journalctl -u facpi -f still works too).
+StandardOutput=append:/home/jaz/media-pi/logs/facpi-daemon.log
+StandardError=append:/home/jaz/media-pi/logs/facpi-daemon.log
+
+# Mild hardening. We still need /dev/video0 + ALSA.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=no
+DeviceAllow=/dev/video0 rw
+DeviceAllow=char-alsa rw
+
+[Install]
+WantedBy=multi-user.target

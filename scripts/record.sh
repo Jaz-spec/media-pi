@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# record.sh — manage a single ffmpeg recording via PID file
-#
-#   record.sh start   → spawn ffmpeg in background, write PID + filename state
-#   record.sh stop    → SIGINT the ffmpeg, wait for it to finalise the .mp4
-#   record.sh status  → "idle" or "recording <file> since <ts>"
-#   record.sh last    → print the last session's filename (set by start)
-#
-# Intentionally small. No concurrency, no session database. Phase 2's FastAPI
-# will call into this; the PID-file + filename pair is the state it reads.
 
 set -euo pipefail
 
