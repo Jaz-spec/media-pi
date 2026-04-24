@@ -64,12 +64,26 @@ go build -o bin/facpi ./cmd/facpi
 
 # -----------------------------------------------------------------------------
 # 4. systemd unit
+#
+# The checked-in facpi.service has "jaz" and "/home/jaz/media-pi" as defaults.
+# We rewrite them here to match the user and repo path actually running the
+# installer — so the unit works for whoever clones the repo without hand-edits.
 # -----------------------------------------------------------------------------
 UNIT_SRC="$REPO_ROOT/deploy/facpi.service"
 UNIT_DST="/etc/systemd/system/facpi.service"
+RUN_USER="${SUDO_USER:-$USER}"
+RUN_GROUP=$(id -gn "$RUN_USER")
 
-echo "install.sh: installing systemd unit at $UNIT_DST"
-sudo cp "$UNIT_SRC" "$UNIT_DST"
+echo "install.sh: installing systemd unit at $UNIT_DST (User=$RUN_USER, WorkingDirectory=$REPO_ROOT)"
+sudo sed \
+  -e "s|^User=.*|User=$RUN_USER|" \
+  -e "s|^Group=.*|Group=$RUN_GROUP|" \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=$REPO_ROOT|" \
+  -e "s|^EnvironmentFile=.*|EnvironmentFile=$REPO_ROOT/.env|" \
+  -e "s|^ExecStart=.*|ExecStart=$REPO_ROOT/bin/facpi daemon|" \
+  -e "s|^StandardOutput=append:.*|StandardOutput=append:$REPO_ROOT/logs/facpi-daemon.log|" \
+  -e "s|^StandardError=append:.*|StandardError=append:$REPO_ROOT/logs/facpi-daemon.log|" \
+  "$UNIT_SRC" | sudo tee "$UNIT_DST" >/dev/null
 sudo systemctl daemon-reload
 
 if systemctl is-enabled --quiet facpi 2>/dev/null; then
@@ -86,3 +100,14 @@ echo "    journalctl -u facpi -f"
 echo
 echo "Open the TUI with:"
 echo "    ./bin/facpi tui"
+
+# -----------------------------------------------------------------------------
+# 5. Optional dependency hint: timg (terminal video preview).
+#    The TUI's `f` key uses timg to render the camera feed as block characters.
+#    Not auto-installed — apt is too intrusive to invoke without consent.
+# -----------------------------------------------------------------------------
+if ! command -v timg >/dev/null 2>&1; then
+  echo
+  echo "install.sh: optional — install timg for the in-TUI camera preview ('f' key):"
+  echo "    sudo apt install -y timg"
+fi

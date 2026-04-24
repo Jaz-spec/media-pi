@@ -25,3 +25,11 @@ type logLinesMsg struct {
 	lines    []string
 	err      error
 }
+
+// previewExitedMsg fires when the suspended preview process (timg) returns
+// control to the TUI. err is whatever the external process produced — nil on
+// clean exit (including timg's normal `q` quit), non-nil on spawn failure
+// or non-zero exit code.
+type previewExitedMsg struct {
+	err error
+}

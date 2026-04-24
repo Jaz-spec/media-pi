@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,6 +13,11 @@ import (
 	"github.com/foundersandcoders/media-pi/internal/config"
 	"github.com/foundersandcoders/media-pi/internal/state"
 )
+
+// previewDevice is the v4l2 path the preview tool opens. Centralised here so
+// we can lift it into Config later if a Pi ever uses something other than
+// /dev/video0 (none currently do).
+const previewDevice = "/dev/video0"
 
 // Model is the root Bubble Tea model. One per running TUI.
 type Model struct {
@@ -124,6 +131,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_, _ = m.emitCommandID(state.CmdRetryUpload, payload,
 				fmt.Sprintf("retry requested for id=%d", u.ID))
 			return m, nil
+		case "f":
+			cmd, banner := m.previewCmd()
+			if banner.style != "" {
+				m.setBanner(banner.style, banner.msg)
+			}
+			return m, cmd
 		}
 
 	case tickMsg:
@@ -154,6 +167,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logLines = msg.lines
 			m.logUploadID = msg.uploadID
 		}
+
+	case previewExitedMsg:
+		if msg.err != nil {
+			m.setBanner("err", "preview exited: "+msg.err.Error())
+		} else {
+			m.setBanner("ok", "preview ended")
+		}
+		// Force an immediate snapshot — the camera may now be free for
+		// recording, and the user expects responsive feedback.
+		return m, snapshotCmd(m.db)
 	}
 	return m, nil
 }
@@ -274,4 +297,50 @@ func (m *Model) setBanner(style, msg string) {
 	m.banner = msg
 	m.bannerStyle = style
 	m.bannerExpiry = time.Now().Add(4 * time.Second)
+}
+
+// bannerHint is a tiny carrier for "set this banner" returned alongside a
+// tea.Cmd, so the caller can update the model AND fire a command in one go.
+type bannerHint struct {
+	style string
+	msg   string
+}
+
+// previewCmd builds the tea.Cmd that suspends the TUI and runs `timg`
+// against /dev/video0. Returns nil + a banner if preview can't run right now
+// (timg missing, recording active, or DB lookup failed).
+func (m Model) previewCmd() (tea.Cmd, bannerHint) {
+	// Refuse early if timg isn't on PATH — friendlier than a cryptic
+	// "exec: timg: not found" surfacing through previewExitedMsg.
+	if _, err := exec.LookPath("timg"); err != nil {
+		return nil, bannerHint{
+			style: "warn",
+			msg:   "preview tool not installed: sudo apt install timg",
+		}
+	}
+
+	// Camera-busy guard: don't even try if the daemon's recording. ffmpeg
+	// would block our v4l2 open with EBUSY anyway, but this gives the
+	// operator a clear message instead of timg flashing an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	if active, err := m.db.ActiveRecording(ctx); err == nil && active != nil {
+		return nil, bannerHint{
+			style: "warn",
+			msg:   "stop recording before previewing",
+		}
+	} else if err != nil && !errors.Is(err, state.ErrNoActiveRecording) {
+		return nil, bannerHint{
+			style: "err",
+			msg:   "couldn't check recording state: " + err.Error(),
+		}
+	}
+
+	// `-V` puts timg in video mode (treat input as a stream). `--frame-rate`
+	// caps the refresh rate to keep CPU + SSH bandwidth modest. Block-char
+	// rendering picks the cell-doubling glyphs automatically.
+	cmd := exec.Command("timg", "-V", "--frame-rate=10", previewDevice)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return previewExitedMsg{err: err}
+	}), bannerHint{}
 }

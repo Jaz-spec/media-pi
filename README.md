@@ -36,10 +36,13 @@ cp .env.example .env
 | `r` | Start recording (prompts interlock if a scheduled event is within 30 min) |
 | `s` | Stop active recording — file is enqueued for upload immediately |
 | `R` | Retry the selected **failed** upload |
+| `f` | Suspend the TUI and show a live camera preview as terminal block characters (requires `timg`; press `q` inside timg to return) |
 | `↑` / `↓` | Select an upload in the queue |
 | `enter` | Refresh the log pane for the selected upload |
 | `y` / `n` | Answer an interlock prompt |
 | `q` / `Ctrl-C` | Quit the TUI (daemon keeps running) |
+
+**Optional dependency for `f`:** `sudo apt install timg` on the Pi. The install script warns if it's missing.
 
 ### CLI equivalents
 
