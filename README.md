@@ -27,7 +27,24 @@ cp .env.example .env
 
 # 4. In another shell (or over SSH), open the TUI
 ./bin/facpi tui
+
+# …or open the TUI with a live camera preview beside it ("studio mode"):
+./scripts/studio.sh
+# (requires `sudo apt install tmux timg` on the Pi)
 ```
+
+### Studio mode
+
+`./scripts/studio.sh` launches the TUI and a live camera preview side-by-side in a tmux split — TUI on the left, timg preview on the right. Quitting either pane (`q` in the TUI, or `q` in timg) tears the whole session down cleanly.
+
+**Important interaction with recording:** the preview and the recorder both open `/dev/video0`, and the camera only allows one opener at a time. While the preview is up, `r` will fail with "camera busy." Workflow:
+
+1. Start in studio mode to frame the shot.
+2. Close the preview pane with **Ctrl-B + x** (tmux kills the focused pane) when you're ready to record.
+3. Press `r` in the TUI. The recording gets the camera.
+4. Press `s` when done. Recording stops, file enqueues for upload.
+
+If you want to preview again between recordings, rerun `./scripts/studio.sh` — or just use the `f` key inside the solo TUI, which does the same thing in full-screen.
 
 ### TUI keys
 

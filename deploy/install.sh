@@ -102,12 +102,16 @@ echo "Open the TUI with:"
 echo "    ./bin/facpi tui"
 
 # -----------------------------------------------------------------------------
-# 5. Optional dependency hint: timg (terminal video preview).
-#    The TUI's `f` key uses timg to render the camera feed as block characters.
+# 5. Optional dependency hint: tmux + timg (camera preview).
+#    - `f` key in the solo TUI uses timg for a full-screen camera preview.
+#    - ./scripts/studio.sh puts the TUI + timg side-by-side in a tmux split.
 #    Not auto-installed — apt is too intrusive to invoke without consent.
 # -----------------------------------------------------------------------------
-if ! command -v timg >/dev/null 2>&1; then
+missing_deps=()
+command -v timg >/dev/null 2>&1 || missing_deps+=("timg")
+command -v tmux >/dev/null 2>&1 || missing_deps+=("tmux")
+if (( ${#missing_deps[@]} > 0 )); then
   echo
-  echo "install.sh: optional — install timg for the in-TUI camera preview ('f' key):"
-  echo "    sudo apt install -y timg"
+  echo "install.sh: optional — missing ${missing_deps[*]} for the camera preview ('f' key / studio mode):"
+  echo "    sudo apt install -y ${missing_deps[*]}"
 fi
