@@ -1,11 +1,15 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -169,9 +173,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case previewExitedMsg:
-		if msg.err != nil {
+		// Always persist stderr to logs/preview.log when there's anything
+		// there — even on a clean exit timg often writes version info to
+		// stderr that's useful for diagnosing later issues.
+		logPath := writePreviewLog(m.cfg.LogDir, msg.stderr)
+
+		switch {
+		case msg.err != nil && msg.stderr != "":
+			// Prefer the first meaningful stderr line in the banner — it's
+			// usually the actual cause. Full text is in preview.log.
+			firstLine := strings.SplitN(strings.TrimSpace(msg.stderr), "\n", 2)[0]
+			if len(firstLine) > 140 {
+				firstLine = firstLine[:137] + "…"
+			}
+			m.setBanner("err", fmt.Sprintf("timg: %s (see %s)", firstLine, logPath))
+		case msg.err != nil:
 			m.setBanner("err", "preview exited: "+msg.err.Error())
-		} else {
+		default:
 			m.setBanner("ok", "preview ended")
 		}
 		// Force an immediate snapshot — the camera may now be free for
@@ -336,11 +354,38 @@ func (m Model) previewCmd() (tea.Cmd, bannerHint) {
 		}
 	}
 
-	// `-V` puts timg in video mode (treat input as a stream). `--frame-rate`
-	// caps the refresh rate to keep CPU + SSH bandwidth modest. Block-char
-	// rendering picks the cell-doubling glyphs automatically.
-	cmd := exec.Command("timg", "-V", "--frame-rate=10", previewDevice)
+	// `-V` tells timg to treat the input as a video stream (not probe it as
+	// an image first). Rendering mode auto-detects: terminals with sixel /
+	// iTerm2-inline-image support get true pixels; plain terminals fall back
+	// to block characters. Frame rate is whatever the camera exposes.
+	cmd := exec.Command("timg", "-V", previewDevice)
+
+	// Capture stderr so we can surface timg's actual error message on exit.
+	// Without this, stderr flashes on the terminal for a fraction of a
+	// second and is immediately overwritten by Bubble Tea's next redraw,
+	// leaving us with only the exit code.
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return previewExitedMsg{err: err}
+		return previewExitedMsg{err: err, stderr: stderrBuf.String()}
 	}), bannerHint{}
+}
+
+// writePreviewLog dumps timg's stderr to logs/preview.log so the operator
+// can inspect the full output after the banner (which is truncated). Called
+// from the previewExitedMsg handler when stderr is non-empty.
+func writePreviewLog(logDir, stderr string) string {
+	if stderr == "" {
+		return ""
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return ""
+	}
+	logPath := filepath.Join(logDir, "preview.log")
+	// Truncate + write on every exit — preview is short-lived, there's no
+	// long history worth keeping.
+	header := fmt.Sprintf("--- preview exited at %s ---\n", time.Now().UTC().Format(time.RFC3339))
+	_ = os.WriteFile(logPath, []byte(header+stderr), 0o644)
+	return logPath
 }

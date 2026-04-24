@@ -29,7 +29,9 @@ type logLinesMsg struct {
 // previewExitedMsg fires when the suspended preview process (timg) returns
 // control to the TUI. err is whatever the external process produced — nil on
 // clean exit (including timg's normal `q` quit), non-nil on spawn failure
-// or non-zero exit code.
+// or non-zero exit code. stderr carries whatever timg wrote to stderr so the
+// banner / log can surface it; stderr is almost always useful when err != nil.
 type previewExitedMsg struct {
-	err error
+	err    error
+	stderr string
 }
