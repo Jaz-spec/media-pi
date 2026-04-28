@@ -339,7 +339,7 @@ func (m Model) previewCmd() (tea.Cmd, bannerHint) {
 	// `-V` puts timg in video mode (treat input as a stream). `--frame-rate`
 	// caps the refresh rate to keep CPU + SSH bandwidth modest. Block-char
 	// rendering picks the cell-doubling glyphs automatically.
-	cmd := exec.Command("timg", "-V", "--frame-rate=10", previewDevice)
+	cmd := exec.Command("timg", "-V", previewDevice)
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return previewExitedMsg{err: err}
 	}), bannerHint{}
