@@ -112,3 +112,10 @@ Host mock-hetzner
 ```
 
 Host-key verification is off for this alias only — the container regenerates its host key on every `docker compose up`, so pinning it would force re-acceptance constantly. Safe because the "network" is localhost and the container is local. Real Hetzner will use `StrictHostKeyChecking accept-new` and a normal known_hosts entry.
+
+## Github account
+To switch a user:
+```bash
+switch-user
+```
+And follow the walkthrough in the terminal. 
