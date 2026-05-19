@@ -59,9 +59,9 @@ func TestParseStartOutput(t *testing.T) {
 	}{
 		{
 			name:        "happy path",
-			stdout:      "recording pid=1234 session=/home/pi/media-pi/recordings/session_20260101_120000\n",
+			stdout:      "recording pid=1234 session=./recordings/session_20260101_120000\n",
 			wantPID:     1234,
-			wantSession: "/home/pi/media-pi/recordings/session_20260101_120000",
+			wantSession: "./recordings/session_20260101_120000",
 		},
 		{
 			name:    "empty",
@@ -92,19 +92,16 @@ func TestParseStartOutput(t *testing.T) {
 
 func TestRecorderStartInsertsAndStopEnqueuesAllSegments(t *testing.T) {
 	db := newTestDB(t)
-	dir := t.TempDir()
-	sessionDir := filepath.Join(dir, "session_20260101_120000")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	recordingsDir := t.TempDir()
+	sessionPrefix := filepath.Join(recordingsDir, "session_20260101_120000")
 
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   "recording pid=777 session=" + sessionDir + "\n",
+			Stdout:   "recording pid=777 session=" + sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 		"scripts/record.sh stop": {
-			Stdout:   sessionDir + "\n",
+			Stdout:   sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 	}}
@@ -119,8 +116,8 @@ func TestRecorderStartInsertsAndStopEnqueuesAllSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if rec.FilePath != sessionDir {
-		t.Fatalf("wrong session dir: %s", rec.FilePath)
+	if rec.FilePath != sessionPrefix {
+		t.Fatalf("wrong session prefix: %s", rec.FilePath)
 	}
 	if rec.FFmpegPID.Int64 != 777 {
 		t.Fatalf("wrong pid: %d", rec.FFmpegPID.Int64)
@@ -131,10 +128,13 @@ func TestRecorderStartInsertsAndStopEnqueuesAllSegments(t *testing.T) {
 		t.Fatalf("expected second Start to error")
 	}
 
-	// Drop two parts; the watcher should enqueue part_001 once part_002 exists,
-	// and leave part_002 (still in-flight) alone until Stop flushes it.
-	writeFile(t, filepath.Join(sessionDir, "part_001.mp4"), "x")
-	writeFile(t, filepath.Join(sessionDir, "part_002.mp4"), "y")
+	// Drop two parts in the flat recordings dir; the watcher should enqueue
+	// part_001 once part_002 exists, and leave part_002 (still in-flight)
+	// alone until Stop flushes it.
+	part1 := sessionPrefix + "_part_001.mp4"
+	part2 := sessionPrefix + "_part_002.mp4"
+	writeFile(t, part1, "x")
+	writeFile(t, part2, "y")
 	waitFor(t, time.Second, func() bool {
 		ups, _ := db.ListUploads(ctx, 10)
 		return len(ups) == 1
@@ -173,6 +173,9 @@ func TestRecorderStartInsertsAndStopEnqueuesAllSegments(t *testing.T) {
 
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent of %s: %v", path, err)
+	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}

@@ -55,12 +55,14 @@ cmd_start() {
     exit 3
   fi
 
-  local ts session_dir pattern logfile
+  # session_prefix is a path with no extension; ffmpeg appends `_part_NNN.mp4`
+  # for each segment. Parts land flat in RECORDINGS_DIR (not in a subdir) so
+  # external tooling that walks `recordings/*.mp4` keeps working.
+  local ts session_prefix pattern logfile
   ts=$(date +%Y%m%d_%H%M%S)
-  session_dir="${RECORDINGS_DIR%/}/session_${ts}"
-  pattern="${session_dir}/part_%03d.mp4"
+  session_prefix="${RECORDINGS_DIR%/}/session_${ts}"
+  pattern="${session_prefix}_part_%03d.mp4"
   logfile="${LOG_DIR%/}/session_${ts}.log"
-  mkdir -p "$session_dir"
 
   # Optional total-duration cap. -t exits ffmpeg cleanly after N seconds; the
   # segment muxer still finalises the in-flight chunk.
@@ -93,9 +95,9 @@ cmd_start() {
     "$pattern" >/dev/null 2>"$logfile" &
 
   local pid=$!
-  echo "$pid"         > "$PID_FILE"
-  echo "$session_dir" > "$SESSION_STATE"
-  date -u +%s         > "$START_STATE"
+  echo "$pid"            > "$PID_FILE"
+  echo "$session_prefix" > "$SESSION_STATE"
+  date -u +%s            > "$START_STATE"
 
   # Give ffmpeg a moment to fail fast (bad device, perms, etc) so we surface
   # the error instead of reporting "recording" for a process that just died.
@@ -107,13 +109,13 @@ cmd_start() {
     exit 4
   fi
 
-  echo "recording pid=$pid session=$session_dir"
+  echo "recording pid=$pid session=$session_prefix"
 }
 
 cmd_stop() {
   if ! is_running; then
     echo "record.sh: not currently recording" >&2
-    # Still echo the last session dir if we have one.
+    # Still echo the last session prefix if we have one.
     [[ -f "$SESSION_STATE" ]] && cat "$SESSION_STATE"
     clear_state
     exit 1

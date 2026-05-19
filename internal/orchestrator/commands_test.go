@@ -16,24 +16,21 @@ import (
 
 func TestCommandConsumerDispatchesStartStop(t *testing.T) {
 	db := newTestDB(t)
-	dir := t.TempDir()
-	sessionDir := filepath.Join(dir, "session_20260101_120000")
-	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	// Drop one sealed part so Stop has something to flush.
-	part := filepath.Join(sessionDir, "part_001.mp4")
+	recordingsDir := t.TempDir()
+	sessionPrefix := filepath.Join(recordingsDir, "session_20260101_120000")
+	// Drop one sealed part (flat in recordings dir) so Stop has something to flush.
+	part := sessionPrefix + "_part_001.mp4"
 	if err := os.WriteFile(part, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write part: %v", err)
 	}
 
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   fmt.Sprintf("recording pid=1001 session=%s\n", sessionDir),
+			Stdout:   fmt.Sprintf("recording pid=1001 session=%s\n", sessionPrefix),
 			ExitCode: 0,
 		},
 		"scripts/record.sh stop": {
-			Stdout:   sessionDir + "\n",
+			Stdout:   sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 	}}

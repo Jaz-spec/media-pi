@@ -14,8 +14,9 @@ import (
 )
 
 // partBadgeRe parses ffmpeg segment-muxer filenames so we can render a
-// "[part 03/05]" badge in the queue.
-var partBadgeRe = regexp.MustCompile(`^part_(\d+)\.mp4$`)
+// "[part 03/05]" badge in the queue. Matches the `_part_NNN.mp4` suffix
+// produced by record.sh.
+var partBadgeRe = regexp.MustCompile(`_part_(\d+)\.mp4$`)
 
 // colour palette & styles — modest defaults; we can theme later.
 var (

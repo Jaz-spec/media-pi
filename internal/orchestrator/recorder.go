@@ -47,9 +47,12 @@ type Recorder struct {
 // segmentSession tracks one in-flight recording: which segments we've already
 // enqueued, the cancel handle for the watcher goroutine, and the recording
 // row id so we can link uploads back to it.
+//
+// prefix is a path with no extension (e.g. ./recordings/session_20260101_120000);
+// ffmpeg writes parts as `<prefix>_part_NNN.mp4` in `filepath.Dir(prefix)`.
 type segmentSession struct {
 	recordingID int64
-	dir         string
+	prefix      string
 	enqueued    map[string]bool
 	cancel      context.CancelFunc
 	done        chan struct{}
@@ -75,8 +78,8 @@ func (r *Recorder) SetUploadWorker(w *worker.Upload) {
 }
 
 // Start invokes `record.sh start [duration_seconds]`, parses stdout to learn
-// the ffmpeg pid and session directory, inserts a recordings row, and spawns
-// a watcher that enqueues sealed segments as they appear.
+// the ffmpeg pid and session prefix, inserts a recordings row, and spawns a
+// watcher that enqueues sealed segments as they appear.
 //
 // EventID is optional; empty = manual recording.
 // durationSeconds is optional; 0 = no time cap.
@@ -104,18 +107,18 @@ func (r *Recorder) Start(ctx context.Context, eventID string, durationSeconds in
 		return nil, fmt.Errorf("record.sh start exited %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 
-	pid, sessionDir, err := parseStartOutput(res.Stdout)
+	pid, sessionPrefix, err := parseStartOutput(res.Stdout)
 	if err != nil {
 		return nil, fmt.Errorf("parse record.sh output: %w (stdout=%q)", err, res.Stdout)
 	}
 
 	// Log path follows record.sh's convention: same basename as the session
-	// directory, .log in the LOG_DIR. Mirrored here so we can present it.
-	logPath := mirrorLogPath(sessionDir, r.cfg.LogDir)
+	// prefix, .log in the LOG_DIR. Mirrored here so we can present it.
+	logPath := mirrorLogPath(sessionPrefix, r.cfg.LogDir)
 
 	id, err := r.db.StartRecording(ctx, state.NewRecordingInput{
 		EventID:       eventID,
-		FilePath:      sessionDir,
+		FilePath:      sessionPrefix,
 		FFmpegPID:     int64(pid),
 		FFmpegLogPath: logPath,
 	})
@@ -127,7 +130,7 @@ func (r *Recorder) Start(ctx context.Context, eventID string, durationSeconds in
 		return nil, fmt.Errorf("fetch new recording id=%d: %w", id, err)
 	}
 
-	r.startWatcher(rec.ID, sessionDir)
+	r.startWatcher(rec.ID, sessionPrefix)
 	return rec, nil
 }
 
@@ -164,9 +167,9 @@ func (r *Recorder) Stop(ctx context.Context, reason string) (*StopResult, error)
 				res.ExitCode, strings.TrimSpace(res.Stderr))
 		}
 	}
-	sessionDir := strings.TrimSpace(res.Stdout)
-	if sessionDir == "" {
-		return nil, errors.New("record.sh stop returned no session dir")
+	sessionPrefix := strings.TrimSpace(res.Stdout)
+	if sessionPrefix == "" {
+		return nil, errors.New("record.sh stop returned no session prefix")
 	}
 
 	// Shut the watcher down and grab the session handle so we can do a final
@@ -182,7 +185,7 @@ func (r *Recorder) Stop(ctx context.Context, reason string) (*StopResult, error)
 		}
 	}
 
-	finalIDs := r.flushSegments(ctx, session, sessionDir, recordingIDOrZero(rec))
+	finalIDs := r.flushSegments(ctx, session, sessionPrefix, recordingIDOrZero(rec))
 
 	out := &StopResult{Recording: rec, UploadIDs: finalIDs}
 	if len(finalIDs) > 0 {
@@ -202,11 +205,11 @@ func (r *Recorder) Status(ctx context.Context) (string, error) {
 }
 
 // startWatcher launches the segment-watcher goroutine for an active session.
-func (r *Recorder) startWatcher(recordingID int64, dir string) {
+func (r *Recorder) startWatcher(recordingID int64, prefix string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &segmentSession{
 		recordingID: recordingID,
-		dir:         dir,
+		prefix:      prefix,
 		enqueued:    make(map[string]bool),
 		cancel:      cancel,
 		done:        make(chan struct{}),
@@ -246,14 +249,15 @@ func (r *Recorder) takeSession() *segmentSession {
 	return sess
 }
 
-// flushSegments runs after Stop: enqueues any remaining sealed parts in the
-// session dir. If session is nil (orphan stop), it builds a fresh enqueued-set
-// keyed off whatever's already in the uploads table for this dir.
-func (r *Recorder) flushSegments(ctx context.Context, session *segmentSession, dir string, recordingID int64) []int64 {
+// flushSegments runs after Stop: enqueues any remaining sealed parts for the
+// session prefix. If session is nil (orphan stop), it builds a fresh
+// enqueued-set; EnqueueUpload's UNIQUE constraint on file_path stops us from
+// double-enqueueing parts a previous run already saw.
+func (r *Recorder) flushSegments(ctx context.Context, session *segmentSession, prefix string, recordingID int64) []int64 {
 	if session == nil {
 		session = &segmentSession{
 			recordingID: recordingID,
-			dir:         dir,
+			prefix:      prefix,
 			enqueued:    make(map[string]bool),
 		}
 	} else if session.recordingID == 0 && recordingID > 0 {
@@ -262,17 +266,17 @@ func (r *Recorder) flushSegments(ctx context.Context, session *segmentSession, d
 	return r.scanAndEnqueue(ctx, session, true)
 }
 
-// scanAndEnqueue lists the session dir, decides which parts are sealed, and
-// enqueues each new one. When `final` is true, every unenqueued part is
-// considered sealed (ffmpeg has exited). When false, only parts whose successor
-// already exists are considered sealed — that's the only way we can know a
-// segment isn't still being written to.
+// scanAndEnqueue lists the segments for this session prefix, decides which
+// are sealed, and enqueues each new one. When `final` is true, every
+// unenqueued part is considered sealed (ffmpeg has exited). When false, only
+// parts whose successor already exists are considered sealed — that's the
+// only way we can know a segment isn't still being written to.
 func (r *Recorder) scanAndEnqueue(ctx context.Context, sess *segmentSession, final bool) []int64 {
-	parts, err := listSegments(sess.dir)
+	parts, err := listSegments(sess.prefix)
 	if err != nil {
-		// Dir might not exist yet on the very first tick; that's fine.
+		// Parent dir might not exist yet on the very first tick; that's fine.
 		if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("recorder: list segments in %s: %v", sess.dir, err)
+			log.Printf("recorder: list segments for %s: %v", sess.prefix, err)
 		}
 		return nil
 	}
@@ -308,9 +312,12 @@ func (r *Recorder) scanAndEnqueue(ctx context.Context, sess *segmentSession, fin
 	return enqueued
 }
 
-// listSegments returns the absolute paths of part_NNN.mp4 files in dir, sorted
-// numerically by part number.
-func listSegments(dir string) ([]string, error) {
+// listSegments returns the paths of all part files matching the given session
+// prefix (e.g. /recordings/session_<ts>), sorted numerically by part number.
+// Parts live flat in filepath.Dir(prefix); the filename is `<basename>_part_NNN.mp4`.
+func listSegments(prefix string) ([]string, error) {
+	dir := filepath.Dir(prefix)
+	wantPrefix := filepath.Base(prefix) + "_part_"
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -321,7 +328,11 @@ func listSegments(dir string) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if !partRe.MatchString(name) {
+		if !strings.HasPrefix(name, wantPrefix) || !strings.HasSuffix(name, ".mp4") {
+			continue
+		}
+		// Reject malformed names so we don't enqueue rubbish.
+		if !partRe.MatchString(name[len(filepath.Base(prefix)):]) {
 			continue
 		}
 		parts = append(parts, filepath.Join(dir, name))
@@ -334,10 +345,11 @@ func listSegments(dir string) ([]string, error) {
 // line record.sh prints on successful start.
 var startOutputRe = regexp.MustCompile(`recording\s+pid=(\d+)\s+session=(\S+)`)
 
-// partRe matches the per-segment filename written by ffmpeg's segment muxer.
-var partRe = regexp.MustCompile(`^part_\d+\.mp4$`)
+// partRe matches the `_part_NNN.mp4` suffix appended to a session prefix
+// basename by ffmpeg's segment muxer.
+var partRe = regexp.MustCompile(`^_part_\d+\.mp4$`)
 
-func parseStartOutput(stdout string) (pid int, sessionDir string, err error) {
+func parseStartOutput(stdout string) (pid int, sessionPrefix string, err error) {
 	m := startOutputRe.FindStringSubmatch(stdout)
 	if m == nil {
 		return 0, "", errors.New("did not find `recording pid=... session=...` line")
@@ -349,10 +361,10 @@ func parseStartOutput(stdout string) (pid int, sessionDir string, err error) {
 	return pid, m[2], nil
 }
 
-// mirrorLogPath reproduces record.sh's convention: the session dir basename
+// mirrorLogPath reproduces record.sh's convention: the session-prefix basename
 // (e.g. session_20260101_120000) becomes the log basename in LOG_DIR.
-func mirrorLogPath(sessionDir, logDir string) string {
-	base := filepath.Base(sessionDir)
+func mirrorLogPath(sessionPrefix, logDir string) string {
+	base := filepath.Base(sessionPrefix)
 	return filepath.Join(strings.TrimSuffix(logDir, "/"), base+".log")
 }
 
