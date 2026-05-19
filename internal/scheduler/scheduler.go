@@ -188,7 +188,7 @@ func (s *Scheduler) fireEvent(ctx context.Context, ev state.Event) {
 		}
 	}
 
-	rec, err := s.recorder.Start(ctx, ev.ID)
+	rec, err := s.recorder.Start(ctx, ev.ID, 0)
 	if err != nil {
 		log.Printf("scheduler fire %s: start failed: %v", ev.ID, err)
 		// Mark as missed rather than staying pending (would re-fire forever).

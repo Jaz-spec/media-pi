@@ -29,7 +29,7 @@ func TestInterlockFlowYesProceedsSkippingEvent(t *testing.T) {
 
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   "recording pid=1001 file=/tmp/manual.mp4\n",
+			Stdout:   "recording pid=1001 session=/tmp/session_manual\n",
 			ExitCode: 0,
 		},
 	}}
@@ -113,7 +113,7 @@ func TestInterlockFlowNoStartsUnlinked(t *testing.T) {
 
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   "recording pid=2001 file=/tmp/manual2.mp4\n",
+			Stdout:   "recording pid=2001 session=/tmp/session_manual2\n",
 			ExitCode: 0,
 		},
 	}}

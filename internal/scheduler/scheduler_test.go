@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,8 +19,10 @@ import (
 )
 
 // fakeExec emulates record.sh with adjustable exit codes / outputs.
+// startSession is the path returned for start/stop (a session directory in
+// the new segment-muxer world).
 type fakeExec struct {
-	startFile string
+	startSession string
 }
 
 func (f *fakeExec) RunScript(_ context.Context, script string, args ...string) (execsh.RunResult, error) {
@@ -29,15 +32,27 @@ func (f *fakeExec) RunScript(_ context.Context, script string, args ...string) (
 	switch args[0] {
 	case "start":
 		return execsh.RunResult{
-			Stdout:   "recording pid=1234 file=" + f.startFile + "\n",
+			Stdout:   "recording pid=1234 session=" + f.startSession + "\n",
 			ExitCode: 0,
 		}, nil
 	case "stop":
-		return execsh.RunResult{Stdout: f.startFile + "\n", ExitCode: 0}, nil
+		return execsh.RunResult{Stdout: f.startSession + "\n", ExitCode: 0}, nil
 	case "status":
-		return execsh.RunResult{Stdout: "recording pid=1234 file=" + f.startFile}, nil
+		return execsh.RunResult{Stdout: "recording pid=1234 session=" + f.startSession}, nil
 	}
 	return execsh.RunResult{ExitCode: 1}, nil
+}
+
+// seedSession creates a session dir containing one sealed part file. Used by
+// tests that expect Stop to enqueue an upload for the session.
+func seedSession(t *testing.T, sessionDir string) {
+	t.Helper()
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "part_001.mp4"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
 }
 
 func (f *fakeExec) StreamScript(_ context.Context, _ string, _ string, _ ...string) (int, error) {
@@ -108,7 +123,9 @@ func TestTickFiresDueEvent(t *testing.T) {
 		StartTime: now.Add(-time.Second), EndTime: now.Add(time.Hour),
 	})
 
-	exec := &fakeExec{startFile: "/tmp/e1.mp4"}
+	sessionDir := filepath.Join(t.TempDir(), "session_e1")
+	seedSession(t, sessionDir)
+	exec := &fakeExec{startSession: sessionDir}
 	cfg := config.Config{
 		FFmpegInputArgs: "x",
 		LogDir:          "/tmp/logs",
@@ -137,9 +154,15 @@ func TestTickPreemptsManualRecording(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
+	tmpRoot := t.TempDir()
+	manualSession := filepath.Join(tmpRoot, "session_manual")
+	schedSession := filepath.Join(tmpRoot, "session_sched")
+	seedSession(t, manualSession)
+	seedSession(t, schedSession)
+
 	// A manual recording is already active.
 	_, err := db.StartRecording(ctx, state.NewRecordingInput{
-		FilePath: "/tmp/manual.mp4", FFmpegPID: 111,
+		FilePath: manualSession, FFmpegPID: 111,
 	})
 	if err != nil {
 		t.Fatalf("prep: %v", err)
@@ -151,7 +174,7 @@ func TestTickPreemptsManualRecording(t *testing.T) {
 		StartTime: now.Add(-time.Second), EndTime: now.Add(time.Hour),
 	})
 
-	exec := &fakeExec{startFile: "/tmp/sched.mp4"}
+	exec := &fakeExec{startSession: schedSession}
 	cfg := config.Config{FFmpegInputArgs: "x", LogDir: "/tmp/logs"}
 	recorder := orchestrator.NewRecorder(db, exec, cfg)
 	up := worker.NewUpload(db, exec, cfg)
@@ -168,8 +191,8 @@ func TestTickPreemptsManualRecording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("active: %v", err)
 	}
-	if active.FilePath != "/tmp/sched.mp4" {
-		t.Fatalf("expected scheduled file to be active; got %s", active.FilePath)
+	if active.FilePath != schedSession {
+		t.Fatalf("expected scheduled session to be active; got %s", active.FilePath)
 	}
 }
 
@@ -184,12 +207,15 @@ func TestTickStopsEventAtEndTime(t *testing.T) {
 	})
 	_ = db.UpdateEventTrigger(ctx, "ending", state.TriggerFired, 0)
 
+	schedSession := filepath.Join(t.TempDir(), "session_sched")
+	seedSession(t, schedSession)
+
 	// And a currently-active recording to stop.
 	_, _ = db.StartRecording(ctx, state.NewRecordingInput{
-		FilePath: "/tmp/sched.mp4", FFmpegPID: 5,
+		FilePath: schedSession, FFmpegPID: 5,
 	})
 
-	exec := &fakeExec{startFile: "/tmp/sched.mp4"}
+	exec := &fakeExec{startSession: schedSession}
 	cfg := config.Config{FFmpegInputArgs: "x", LogDir: "/tmp/logs"}
 	recorder := orchestrator.NewRecorder(db, exec, cfg)
 	up := worker.NewUpload(db, exec, cfg)
@@ -197,16 +223,17 @@ func TestTickStopsEventAtEndTime(t *testing.T) {
 
 	s.tickOnce(ctx)
 
-	// Recording should now be stopped + upload enqueued.
+	// Recording should now be stopped + segment enqueued.
 	if _, err := db.ActiveRecording(ctx); err == nil {
 		t.Fatalf("expected no active recording after scheduled_end")
 	}
-	// Upload row should exist.
+	// Upload row should exist for the seeded part.
 	u, err := db.NextPendingUpload(ctx)
 	if err != nil {
 		t.Fatalf("expected upload enqueued: %v", err)
 	}
-	if u.FilePath != "/tmp/sched.mp4" {
-		t.Fatalf("wrong upload file: %s", u.FilePath)
+	wantPart := filepath.Join(schedSession, "part_001.mp4")
+	if u.FilePath != wantPart {
+		t.Fatalf("wrong upload file: %s (want %s)", u.FilePath, wantPart)
 	}
 }
