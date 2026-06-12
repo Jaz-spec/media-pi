@@ -5,11 +5,12 @@
 #   ./scripts/diagnose.sh --no-net  # skip the upload/network checks
 #
 # Tests run inside-out: Pi health → disk → recorder state → USB → video →
-# audio → full capture → network → remote. An early FAIL usually explains
+# audio → full capture → upload tooling → API. An early FAIL usually explains
 # every FAIL after it, so fix top-down.
 #
-# Read-only except for: a 3s throwaway capture in /tmp, a 2s mic capture in
-# /tmp, and a 32-byte rsync round-trip file that is deleted from the remote.
+# Read-only except for: a 3s throwaway capture in /tmp and a 2s mic capture in
+# /tmp. The API probe sends a register with an invalid extension on purpose —
+# it proves reachability + auth without creating a draft video row.
 
 set -uo pipefail
 
@@ -190,40 +191,82 @@ fi
 
 # ---------------------------------------------------------------------------
 if (( SKIP_NET )); then
-  section "10–12. network/upload checks skipped (--no-net)"
+  section "10–13. upload/API checks skipped (--no-net)"
 else
-  section "10. SSH to upload target ($REMOTE_HOST)"
-  # Known gotcha: ~/.ssh/config hard-codes the Mac's IP; a DHCP renewal on the
-  # Mac breaks this with exit 255 / 'No route to host'.
-  if ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" 'echo ok' >/dev/null 2>&1; then
-    pass "ssh $REMOTE_HOST reachable"
-  else
-    fail "cannot ssh to $REMOTE_HOST — uploads will fail with rsync exit 255"
-    target_ip=$(awk -v h="$REMOTE_HOST" '$1=="Host" {m=($2==h)} m && $1=="HostName" {print $2}' ~/.ssh/config 2>/dev/null)
-    echo "        ~/.ssh/config points at: ${target_ip:-<no HostName found>}"
-    echo "        fix: on the Mac run 'ipconfig getifaddr en0', update HostName in the Pi's ~/.ssh/config"
-    echo "        also check on the Mac: docker ps (openssh-server container up?)"
-  fi
-
-  section "11. rsync round-trip + remote disk"
-  if ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" 'echo ok' >/dev/null 2>&1; then
-    echo "diag $(hostname)" > /tmp/diag_roundtrip.txt
-    if rsync -az --timeout=15 /tmp/diag_roundtrip.txt "${REMOTE_HOST}:${REMOTE_PATH%/}/" >/dev/null 2>&1 \
-       && ssh "$REMOTE_HOST" "rm -f ${REMOTE_PATH%/}/diag_roundtrip.txt" 2>/dev/null; then
-      pass "rsync write + remote delete OK"
+  section "10. Upload tooling + config (upload-cdn.sh prerequisites)"
+  # upload-cdn.sh hard-requires curl + jq, and FAC_API_URL/FAC_API_KEY in .env.
+  tools_ok=1
+  for bin in curl jq; do
+    if command -v "$bin" >/dev/null; then
+      pass "$bin installed"
     else
-      fail "ssh works but rsync write to ${REMOTE_PATH} failed — remote disk full, path missing, or rsync not installed on remote"
+      fail "$bin not installed — upload-cdn.sh needs it (sudo apt install -y $bin)"
+      tools_ok=0
     fi
-    remote_free=$(ssh "$REMOTE_HOST" "df -m ${REMOTE_PATH} 2>/dev/null" | awk 'NR==2 {print $4}')
-    [[ -n "$remote_free" ]] && echo "        remote free space: ${remote_free}MB"
+  done
+  cfg_ok=1
+  if [[ -z "${FAC_API_URL:-}" ]]; then
+    fail "FAC_API_URL not set in .env"
+    cfg_ok=0
   else
-    warn "skipped (no ssh from test 10)"
+    pass "FAC_API_URL set: $FAC_API_URL"
+  fi
+  if [[ -z "${FAC_API_KEY:-}" || "${FAC_API_KEY:-}" == "replace-me" ]]; then
+    fail "FAC_API_KEY missing or still the .env.example placeholder"
+    cfg_ok=0
+  else
+    pass "FAC_API_KEY set (${#FAC_API_KEY} chars)"
   fi
 
-  section "12. Stranded uploads (.failed markers)"
+  section "11. API reachable (DNS / route / TLS)"
+  # Unauthenticated poke — ANY http status proves the network path to the API
+  # is fine; 000 means DNS failure, no route, or TLS handshake failure.
+  if (( tools_ok && cfg_ok )); then
+    api_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 8 "$FAC_API_URL" || true)
+    if [[ "$api_code" != "000" && -n "$api_code" ]]; then
+      pass "API endpoint answered (HTTP $api_code) — wifi/DNS/TLS all fine"
+    else
+      fail "no HTTP response from $FAC_API_URL — Pi has no route to the API (wifi down? DNS? captive portal?)"
+      echo "        isolate with: ping -c2 8.8.8.8 (route) then curl -sI https://google.com (DNS+TLS)"
+    fi
+  else
+    warn "skipped (test 10 failed)"
+    api_code="000"
+  fi
+
+  section "12. API auth — register probe (no draft row created)"
+  # Real register mutation with a deliberately invalid extension. A 401/403
+  # means the key is rejected; a validation error means auth WORKS and the
+  # whole register path is healthy — without registering a junk draft video.
+  if [[ "$api_code" != "000" ]] && (( tools_ok && cfg_ok )); then
+    probe_body=$(jq -nc '{
+      source: "mutation WatchIngestRegister($ext:String!){ watch_ingest_register(ext:$ext) }",
+      variableValues: { ext: "diagprobe" }
+    }')
+    probe_resp=$(curl -s -w '\n%{http_code}' --connect-timeout 8 -X POST "$FAC_API_URL" \
+      -H "Authorization: Bearer $FAC_API_KEY" \
+      -H "Content-Type: application/json" \
+      --data "$probe_body" || true)
+    probe_code=$(tail -1 <<<"$probe_resp")
+    probe_json=$(sed '$d' <<<"$probe_resp")
+    if [[ "$probe_code" == "401" || "$probe_code" == "403" ]]; then
+      fail "API rejected the key (HTTP $probe_code) — check FAC_API_KEY in .env against core.api_keys"
+    elif jq -e '.upload_url' <<<"$probe_json" >/dev/null 2>&1; then
+      # Server accepted ext=diagprobe — unexpected, and it DID create a draft.
+      warn "register unexpectedly succeeded for ext=diagprobe — a draft row was created: $(jq -c '{video_id}' <<<"$probe_json")"
+      pass "auth + register path working (HTTP $probe_code)"
+    else
+      pass "key accepted; register answered HTTP $probe_code (invalid-ext probe rejected as expected)"
+      echo "        response: $(head -c 200 <<<"$probe_json")"
+    fi
+  else
+    warn "skipped (API unreachable or missing prerequisites)"
+  fi
+
+  section "13. Stranded uploads (.failed markers)"
   markers=$(ls "$RECORDINGS_DIR"/*.failed 2>/dev/null || true)
   if [[ -n "$markers" ]]; then
-    warn "failed-upload markers found — retry with ./scripts/upload.sh <file> once 10/11 pass:"
+    warn "failed-upload markers found — retry with ./scripts/upload-cdn.sh <file> once 10–12 pass:"
     for m in $markers; do echo "        | $(cat "$m")"; done
   else
     pass "no .failed markers in $RECORDINGS_DIR"
