@@ -56,7 +56,20 @@ cmd_start() {
   filename="${RECORDINGS_DIR%/}/session_${ts}.mp4"
   logfile="${LOG_DIR%/}/session_${ts}.log"
 
-  # ffmpeg: input flags come from .env, encoding is fixed (H.264 CRF 23 + AAC).
+  # Video codec is platform config (.env), same pattern as FFMPEG_INPUT_ARGS:
+  #   VIDEO_CODEC=copy (Pi) — mux the camera's onboard H.264 straight through.
+  #     The Pi 5 has no hardware encoder; libx264 can't hold 1080p30 realtime
+  #     (speed ~0.93x), and a live source that falls behind starves the audio
+  #     input — heard as laggy, in-and-out sound.
+  #   VIDEO_CODEC unset (Mac dev) — libx264-encode the raw avfoundation frames.
+  local video_args
+  if [[ "${VIDEO_CODEC:-libx264}" == "copy" ]]; then
+    video_args=(-c:v copy)
+  else
+    video_args=(-c:v libx264 -preset veryfast -crf 23)
+  fi
+
+  # ffmpeg: input flags come from .env, audio is fixed (AAC).
   # We do NOT quote $FFMPEG_INPUT_ARGS — it contains multiple tokens that must
   # be split into separate argv entries.
   # nohup + background + PID capture is the idiomatic way to own a long-running
@@ -64,7 +77,7 @@ cmd_start() {
   # shellcheck disable=SC2086
   nohup ffmpeg -hide_banner -nostdin -y \
     $FFMPEG_INPUT_ARGS \
-    -c:v libx264 -preset veryfast -crf 23 \
+    "${video_args[@]}" \
     -c:a aac \
     -movflags frag_keyframe+empty_moov \
     "$filename" >/dev/null 2>"$logfile" &
