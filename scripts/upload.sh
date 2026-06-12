@@ -56,12 +56,17 @@ if [[ ! -s "$FILE" ]]; then
 fi
 
 # If record.sh is still writing this file, refuse. Upload of an open file can
-# race with mp4 finalisation.
+# race with mp4 finalisation. With the segment muxer the "in-flight file" is
+# the highest-numbered part for the active session prefix; earlier parts are
+# sealed and safe to upload.
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  current_file=$(cat "${PID_FILE}.file" 2>/dev/null || true)
-  if [[ "$current_file" == "$FILE" ]]; then
-    echo "upload.sh: $FILE is currently being recorded — stop first" >&2
-    exit 2
+  current_session=$(cat "${PID_FILE}.session" 2>/dev/null || true)
+  if [[ -n "$current_session" && "$FILE" == "${current_session}_part_"* ]]; then
+    latest=$(ls -1 "${current_session}_part_"*.mp4 2>/dev/null | sort | tail -1)
+    if [[ "$latest" == "$FILE" ]]; then
+      echo "upload.sh: $FILE is the in-flight segment — wait for next chunk to roll" >&2
+      exit 2
+    fi
   fi
 fi
 

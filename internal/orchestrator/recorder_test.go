@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/foundersandcoders/media-pi/internal/config"
 	"github.com/foundersandcoders/media-pi/internal/execsh"
@@ -49,17 +51,17 @@ func newTestDB(t *testing.T) *state.DB {
 
 func TestParseStartOutput(t *testing.T) {
 	cases := []struct {
-		name     string
-		stdout   string
-		wantPID  int
-		wantFile string
-		wantErr  bool
+		name        string
+		stdout      string
+		wantPID     int
+		wantSession string
+		wantErr     bool
 	}{
 		{
-			name:     "happy path",
-			stdout:   "recording pid=1234 file=/home/pi/media-pi/recordings/session_20260101_120000.mp4\n",
-			wantPID:  1234,
-			wantFile: "/home/pi/media-pi/recordings/session_20260101_120000.mp4",
+			name:        "happy path",
+			stdout:      "recording pid=1234 session=./recordings/session_20260101_120000\n",
+			wantPID:     1234,
+			wantSession: "./recordings/session_20260101_120000",
 		},
 		{
 			name:    "empty",
@@ -74,53 +76,69 @@ func TestParseStartOutput(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pid, file, err := parseStartOutput(tc.stdout)
+			pid, session, err := parseStartOutput(tc.stdout)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
 			}
 			if tc.wantErr {
 				return
 			}
-			if pid != tc.wantPID || file != tc.wantFile {
-				t.Fatalf("got pid=%d file=%q; want pid=%d file=%q", pid, file, tc.wantPID, tc.wantFile)
+			if pid != tc.wantPID || session != tc.wantSession {
+				t.Fatalf("got pid=%d session=%q; want pid=%d session=%q", pid, session, tc.wantPID, tc.wantSession)
 			}
 		})
 	}
 }
 
-func TestRecorderStartInsertsAndStopEnqueues(t *testing.T) {
+func TestRecorderStartInsertsAndStopEnqueuesAllSegments(t *testing.T) {
 	db := newTestDB(t)
-	file := "/tmp/session_20260101_120000.mp4"
+	recordingsDir := t.TempDir()
+	sessionPrefix := filepath.Join(recordingsDir, "session_20260101_120000")
+
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   "recording pid=777 file=" + file + "\n",
+			Stdout:   "recording pid=777 session=" + sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 		"scripts/record.sh stop": {
-			Stdout:   file + "\n",
+			Stdout:   sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 	}}
 	cfg := config.Config{FFmpegInputArgs: "-f v4l2 -i /dev/video0", LogDir: "/tmp/logs"}
 
 	r := NewRecorder(db, exec, cfg)
+	// Faster ticks so the mid-recording assertion doesn't hang.
+	r.segmentPollInterval = 20 * time.Millisecond
 	ctx := context.Background()
 
-	rec, err := r.Start(ctx, "")
+	rec, err := r.Start(ctx, "", 0)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if rec.FilePath != file {
-		t.Fatalf("wrong file path: %s", rec.FilePath)
+	if rec.FilePath != sessionPrefix {
+		t.Fatalf("wrong session prefix: %s", rec.FilePath)
 	}
 	if rec.FFmpegPID.Int64 != 777 {
 		t.Fatalf("wrong pid: %d", rec.FFmpegPID.Int64)
 	}
 
 	// Starting again should error because DB has an active row.
-	if _, err := r.Start(ctx, ""); err == nil {
+	if _, err := r.Start(ctx, "", 0); err == nil {
 		t.Fatalf("expected second Start to error")
 	}
+
+	// Drop two parts in the flat recordings dir; the watcher should enqueue
+	// part_001 once part_002 exists, and leave part_002 (still in-flight)
+	// alone until Stop flushes it.
+	part1 := sessionPrefix + "_part_001.mp4"
+	part2 := sessionPrefix + "_part_002.mp4"
+	writeFile(t, part1, "x")
+	writeFile(t, part2, "y")
+	waitFor(t, time.Second, func() bool {
+		ups, _ := db.ListUploads(ctx, 10)
+		return len(ups) == 1
+	})
 
 	res, err := r.Stop(ctx, "")
 	if err != nil {
@@ -129,24 +147,42 @@ func TestRecorderStartInsertsAndStopEnqueues(t *testing.T) {
 	if res.Recording.Status != state.RecordingStopped {
 		t.Fatalf("expected stopped; got %q", res.Recording.Status)
 	}
-	if res.UploadID == 0 {
-		t.Fatalf("expected upload to be enqueued")
+	if len(res.UploadIDs) != 1 {
+		t.Fatalf("expected stop to flush 1 trailing chunk; got %v", res.UploadIDs)
 	}
-	// Upload row should exist, be pending, and linked to the recording.
-	up, err := db.NextPendingUpload(ctx)
+	if res.UploadID != res.UploadIDs[0] {
+		t.Fatalf("UploadID should mirror the last UploadIDs entry")
+	}
+
+	ups, err := db.ListUploads(ctx, 10)
 	if err != nil {
-		t.Fatalf("next pending: %v", err)
+		t.Fatalf("list: %v", err)
 	}
-	if up.ID != res.UploadID {
-		t.Fatalf("upload id mismatch")
+	if len(ups) != 2 {
+		t.Fatalf("expected 2 uploads (one per part); got %d", len(ups))
 	}
-	if !up.RecordingID.Valid || up.RecordingID.Int64 != res.Recording.ID {
-		t.Fatalf("upload.recording_id should link to the recording")
+	for _, u := range ups {
+		if !u.RecordingID.Valid || u.RecordingID.Int64 != rec.ID {
+			t.Fatalf("upload %d not linked to recording", u.ID)
+		}
+		if u.Status != state.UploadPending {
+			t.Fatalf("upload %d expected pending; got %s", u.ID, u.Status)
+		}
+	}
+}
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir parent of %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 
 func TestMirrorLogPath(t *testing.T) {
-	got := mirrorLogPath("/home/pi/media-pi/recordings/session_20260101_120000.mp4", "/home/pi/media-pi/logs")
+	got := mirrorLogPath("/home/pi/media-pi/recordings/session_20260101_120000", "/home/pi/media-pi/logs")
 	want := "/home/pi/media-pi/logs/session_20260101_120000.log"
 	if got != want {
 		t.Fatalf("got %q; want %q", got, want)

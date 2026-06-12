@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,19 +16,27 @@ import (
 
 func TestCommandConsumerDispatchesStartStop(t *testing.T) {
 	db := newTestDB(t)
-	file := "/tmp/session_20260101_120000.mp4"
+	recordingsDir := t.TempDir()
+	sessionPrefix := filepath.Join(recordingsDir, "session_20260101_120000")
+	// Drop one sealed part (flat in recordings dir) so Stop has something to flush.
+	part := sessionPrefix + "_part_001.mp4"
+	if err := os.WriteFile(part, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+
 	exec := &fakeExec{outputs: map[string]execsh.RunResult{
 		"scripts/record.sh start": {
-			Stdout:   fmt.Sprintf("recording pid=1001 file=%s\n", file),
+			Stdout:   fmt.Sprintf("recording pid=1001 session=%s\n", sessionPrefix),
 			ExitCode: 0,
 		},
 		"scripts/record.sh stop": {
-			Stdout:   file + "\n",
+			Stdout:   sessionPrefix + "\n",
 			ExitCode: 0,
 		},
 	}}
 	cfg := config.Config{FFmpegInputArgs: "-f v4l2 -i /dev/video0", LogDir: "/tmp/logs"}
 	recorder := NewRecorder(db, exec, cfg)
+	recorder.segmentPollInterval = 20 * time.Millisecond
 	up := worker.NewUpload(db, exec, cfg)
 
 	consumer := NewCommandConsumer(db, recorder, up, cfg)
@@ -63,13 +73,13 @@ func TestCommandConsumerDispatchesStartStop(t *testing.T) {
 		c, _ := db.GetCommand(ctx, stopID)
 		return c != nil && c.Status == state.CmdDone
 	})
-	// Upload should be enqueued.
+	// The lone sealed part should be enqueued.
 	u, err := db.NextPendingUpload(ctx)
 	if err != nil {
 		t.Fatalf("expected upload enqueued: %v", err)
 	}
-	if u.FilePath != file {
-		t.Fatalf("wrong file: %s", u.FilePath)
+	if u.FilePath != part {
+		t.Fatalf("wrong file: %s (want %s)", u.FilePath, part)
 	}
 
 	cancel()

@@ -79,7 +79,7 @@ func usage() {
 Usage:
   facpi daemon                 run the background daemon
   facpi tui                    open the Bubble Tea dashboard (read-only, Phase 3)
-  facpi record start           start a recording via record.sh
+  facpi record start [secs]    start a recording via record.sh (optional total duration in seconds)
   facpi record stop            stop active recording + enqueue upload
   facpi record status          show recorder status
   facpi enqueue <file>         add a file to the upload queue
@@ -125,6 +125,7 @@ func cmdDaemon(_ []string) error {
 	up.Wake()
 
 	recorder := orchestrator.NewRecorder(db, execer, cfg)
+	recorder.SetUploadWorker(up)
 	consumer := orchestrator.NewCommandConsumer(db, recorder, up, cfg)
 
 	go runHeartbeat(ctx, db)
@@ -269,11 +270,20 @@ func cmdRecord(args []string) error {
 
 	switch action {
 	case "start":
-		r, err := rec.Start(ctx, "")
+		// Optional second arg: duration in seconds. 0 = no cap.
+		var duration int
+		if len(args) >= 2 {
+			n, perr := strconv.Atoi(args[1])
+			if perr != nil || n < 0 {
+				return fmt.Errorf("invalid duration %q (want non-negative seconds)", args[1])
+			}
+			duration = n
+		}
+		r, err := rec.Start(ctx, "", duration)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("recording id=%d file=%s pid=%d\n",
+		fmt.Printf("recording id=%d session=%s pid=%d\n",
 			r.ID, r.FilePath, r.FFmpegPID.Int64)
 		return nil
 	case "stop":

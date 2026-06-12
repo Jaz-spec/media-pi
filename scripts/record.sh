@@ -15,23 +15,27 @@ fi
 set -a; source .env; set +a
 
 PID_FILE="${PID_FILE:-/tmp/fac-recorder.pid}"
-FILE_STATE="${PID_FILE}.file"
+SESSION_STATE="${PID_FILE}.session"
 START_STATE="${PID_FILE}.started_at"
 RECORDINGS_DIR="${RECORDINGS_DIR:-./recordings}"
 LOG_DIR="${LOG_DIR:-./logs}"
 DISK_SPACE_MIN_MB="${DISK_SPACE_MIN_MB:-500}"
+SEGMENT_TIME_SECONDS="${SEGMENT_TIME_SECONDS:-800}"
 
 is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
 clear_state() {
-  rm -f "$PID_FILE" "$FILE_STATE" "$START_STATE"
+  rm -f "$PID_FILE" "$SESSION_STATE" "$START_STATE"
 }
 
 cmd_start() {
+  # Optional positional duration in seconds (0 / unset = no limit).
+  local duration="${1:-0}"
+
   if is_running; then
-    echo "record.sh: already recording (pid $(cat "$PID_FILE"), file $(cat "$FILE_STATE" 2>/dev/null))" >&2
+    echo "record.sh: already recording (pid $(cat "$PID_FILE"), session $(cat "$SESSION_STATE" 2>/dev/null))" >&2
     exit 1
   fi
   # Stale state from a crashed run: clean up before checking disk.
@@ -51,28 +55,49 @@ cmd_start() {
     exit 3
   fi
 
-  local ts filename logfile
+  # session_prefix is a path with no extension; ffmpeg appends `_part_NNN.mp4`
+  # for each segment. Parts land flat in RECORDINGS_DIR (not in a subdir) so
+  # external tooling that walks `recordings/*.mp4` keeps working.
+  local ts session_prefix pattern logfile
   ts=$(date +%Y%m%d_%H%M%S)
-  filename="${RECORDINGS_DIR%/}/session_${ts}.mp4"
+  session_prefix="${RECORDINGS_DIR%/}/session_${ts}"
+  pattern="${session_prefix}_part_%03d.mp4"
   logfile="${LOG_DIR%/}/session_${ts}.log"
 
-  # ffmpeg: input flags come from .env, encoding is fixed (H.264 CRF 23 + AAC).
+  # Optional total-duration cap. -t exits ffmpeg cleanly after N seconds; the
+  # segment muxer still finalises the in-flight chunk.
+  local duration_args=()
+  if [[ -n "$duration" && "$duration" -gt 0 ]]; then
+    duration_args=(-t "$duration")
+  fi
+
+  # ffmpeg with the segment muxer:
+  #   -force_key_frames pins a keyframe at every segment boundary so cuts are
+  #     clean (no held frame at the start of part_NNN+1).
+  #   -reset_timestamps 1 makes each part start at PTS 0 — needed for players
+  #     that expect each mp4 to be standalone.
+  #   -segment_format mp4 + the encoder/audio chain mirrors what we used to
+  #     write to a single mp4. The segment muxer keeps one continuous encode
+  #     across all parts, so there's no AAC priming silence at boundaries.
   # We do NOT quote $FFMPEG_INPUT_ARGS — it contains multiple tokens that must
   # be split into separate argv entries.
-  # nohup + background + PID capture is the idiomatic way to own a long-running
-  # subprocess from a short-lived script.
   # shellcheck disable=SC2086
   nohup ffmpeg -hide_banner -nostdin -y \
     $FFMPEG_INPUT_ARGS \
     -c:v libx264 -preset veryfast -crf 23 \
+    -force_key_frames "expr:gte(t,n_forced*${SEGMENT_TIME_SECONDS})" \
     -c:a aac \
-    -movflags frag_keyframe+empty_moov \
-    "$filename" >/dev/null 2>"$logfile" &
+    -f segment \
+    -segment_time "$SEGMENT_TIME_SECONDS" \
+    -segment_format mp4 \
+    -reset_timestamps 1 \
+    "${duration_args[@]}" \
+    "$pattern" >/dev/null 2>"$logfile" &
 
   local pid=$!
-  echo "$pid"      > "$PID_FILE"
-  echo "$filename" > "$FILE_STATE"
-  date -u +%s      > "$START_STATE"
+  echo "$pid"            > "$PID_FILE"
+  echo "$session_prefix" > "$SESSION_STATE"
+  date -u +%s            > "$START_STATE"
 
   # Give ffmpeg a moment to fail fast (bad device, perms, etc) so we surface
   # the error instead of reporting "recording" for a process that just died.
@@ -84,24 +109,24 @@ cmd_start() {
     exit 4
   fi
 
-  echo "recording pid=$pid file=$filename"
+  echo "recording pid=$pid session=$session_prefix"
 }
 
 cmd_stop() {
   if ! is_running; then
     echo "record.sh: not currently recording" >&2
-    # Still echo the last filename if we have one, so callers can pipe to upload
-    [[ -f "$FILE_STATE" ]] && cat "$FILE_STATE"
+    # Still echo the last session prefix if we have one.
+    [[ -f "$SESSION_STATE" ]] && cat "$SESSION_STATE"
     clear_state
     exit 1
   fi
 
-  local pid file
+  local pid session
   pid=$(cat "$PID_FILE")
-  file=$(cat "$FILE_STATE")
+  session=$(cat "$SESSION_STATE")
 
-  # SIGINT (not SIGKILL). ffmpeg uses this to finalise the mp4 — writing the
-  # `moov` atom with chunk offsets. Without it, the file is unplayable.
+  # SIGINT (not SIGKILL). ffmpeg uses this to finalise the in-flight segment;
+  # without it, the last part_NNN.mp4 is unplayable (missing moov atom).
   kill -INT "$pid"
 
   # Bounded wait for graceful exit. 10s is generous for the finalise step.
@@ -119,17 +144,17 @@ cmd_stop() {
   fi
 
   clear_state
-  echo "$file"
+  echo "$session"
 }
 
 cmd_status() {
   if is_running; then
-    local pid file started_at
+    local pid session started_at
     pid=$(cat "$PID_FILE")
-    file=$(cat "$FILE_STATE" 2>/dev/null || echo "<unknown>")
+    session=$(cat "$SESSION_STATE" 2>/dev/null || echo "<unknown>")
     started_at=$(cat "$START_STATE" 2>/dev/null || echo "0")
     local elapsed=$(( $(date -u +%s) - started_at ))
-    echo "recording pid=$pid file=$file elapsed=${elapsed}s"
+    echo "recording pid=$pid session=$session elapsed=${elapsed}s"
   else
     # If PID file exists but process died, clean up so `start` works next.
     [[ -f "$PID_FILE" ]] && clear_state
@@ -138,8 +163,8 @@ cmd_status() {
 }
 
 cmd_last() {
-  if [[ -f "$FILE_STATE" ]]; then
-    cat "$FILE_STATE"
+  if [[ -f "$SESSION_STATE" ]]; then
+    cat "$SESSION_STATE"
   else
     echo "record.sh: no session state — nothing to report" >&2
     exit 1
@@ -147,12 +172,12 @@ cmd_last() {
 }
 
 case "${1:-}" in
-  start)  cmd_start  ;;
+  start)  shift; cmd_start  "$@" ;;
   stop)   cmd_stop   ;;
   status) cmd_status ;;
   last)   cmd_last   ;;
   *)
-    echo "usage: $0 {start|stop|status|last}" >&2
+    echo "usage: $0 {start [duration_seconds]|stop|status|last}" >&2
     exit 2
     ;;
 esac

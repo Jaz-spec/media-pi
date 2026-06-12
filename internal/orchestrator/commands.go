@@ -88,8 +88,9 @@ func (c *CommandConsumer) dispatch(ctx context.Context, cmd *state.Command) {
 func (c *CommandConsumer) handleStart(ctx context.Context, cmd *state.Command) {
 	// Parse payload (optional).
 	var payload struct {
-		EventID        string `json:"event_id"`
-		SkipInterlock  bool   `json:"skip_interlock"`
+		EventID         string `json:"event_id"`
+		SkipInterlock   bool   `json:"skip_interlock"`
+		DurationSeconds int    `json:"duration_seconds"`
 	}
 	if cmd.Payload.Valid {
 		_ = json.Unmarshal([]byte(cmd.Payload.String), &payload)
@@ -118,7 +119,7 @@ func (c *CommandConsumer) handleStart(ctx context.Context, cmd *state.Command) {
 		}
 	}
 
-	rec, err := c.recorder.Start(ctx, payload.EventID)
+	rec, err := c.recorder.Start(ctx, payload.EventID, payload.DurationSeconds)
 	if err != nil {
 		_ = c.db.MarkCommandError(ctx, cmd.ID, jsonErr(err.Error()))
 		return
@@ -172,7 +173,7 @@ func (c *CommandConsumer) handleResolveInterlock(ctx context.Context, cmd *state
 				log.Printf("resolve interlock yes: mark skipped: %v", err)
 			}
 		}
-		rec, err := c.recorder.Start(ctx, meta.EventID)
+		rec, err := c.recorder.Start(ctx, meta.EventID, 0)
 		if err != nil {
 			_ = c.db.MarkCommandError(ctx, p.OriginalCmdID, jsonErr(err.Error()))
 			_ = c.db.MarkCommandError(ctx, cmd.ID, jsonErr(err.Error()))
@@ -190,7 +191,7 @@ func (c *CommandConsumer) handleResolveInterlock(ctx context.Context, cmd *state
 	case "no":
 		// Start without touching the event. The scheduler will pre-empt at
 		// start_time.
-		rec, err := c.recorder.Start(ctx, "")
+		rec, err := c.recorder.Start(ctx, "", 0)
 		if err != nil {
 			_ = c.db.MarkCommandError(ctx, p.OriginalCmdID, jsonErr(err.Error()))
 			_ = c.db.MarkCommandError(ctx, cmd.ID, jsonErr(err.Error()))

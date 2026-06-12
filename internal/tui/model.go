@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -49,6 +50,18 @@ type Model struct {
 	// Last start_recording command we emitted; we watch its result to see
 	// if the daemon needs an interlock resolution.
 	watchedStartCmdID int64
+
+	// Filming-duration cap the operator has set, in minutes. 0 = no cap.
+	// Persists across recordings so a workshop pattern can be set once.
+	sessionDurationMins int
+
+	// Duration-input modal state. Non-nil means we are displaying the modal.
+	durationModal *durationModalState
+}
+
+// durationModalState holds the text being typed into the duration prompt.
+type durationModalState struct {
+	input string
 }
 
 // interlockState captures everything the modal needs to render itself and
@@ -97,6 +110,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// Duration-input modal: capture digits, backspace, enter, esc.
+		if m.durationModal != nil {
+			switch key := msg.String(); key {
+			case "esc":
+				m.durationModal = nil
+				return m, nil
+			case "enter":
+				m = m.commitDurationModal()
+				return m, nil
+			case "backspace":
+				if len(m.durationModal.input) > 0 {
+					m.durationModal.input = m.durationModal.input[:len(m.durationModal.input)-1]
+				}
+				return m, nil
+			default:
+				if len(key) == 1 && key[0] >= '0' && key[0] <= '9' && len(m.durationModal.input) < 4 {
+					m.durationModal.input += key
+				}
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -113,13 +147,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			return m, m.currentLogTailCmd()
 		case "r":
-			id, ok := m.emitCommandID(state.CmdStartRecording, "", "recording requested")
+			payload := ""
+			banner := "recording requested"
+			if m.sessionDurationMins > 0 {
+				payload = fmt.Sprintf(`{"duration_seconds":%d}`, m.sessionDurationMins*60)
+				banner = fmt.Sprintf("recording requested (max %d min)", m.sessionDurationMins)
+			}
+			id, ok := m.emitCommandID(state.CmdStartRecording, payload, banner)
 			if ok {
 				m.watchedStartCmdID = id
 			}
 			return m, nil
 		case "s":
 			_, _ = m.emitCommandID(state.CmdStopRecording, "", "stop requested")
+			return m, nil
+		case "t":
+			// Pre-fill with current setting so the user can edit instead of
+			// retyping. Empty string when no cap is set.
+			seed := ""
+			if m.sessionDurationMins > 0 {
+				seed = strconv.Itoa(m.sessionDurationMins)
+			}
+			m.durationModal = &durationModalState{input: seed}
 			return m, nil
 		case "R":
 			u := m.selectedUpload()
@@ -290,6 +339,33 @@ func (m Model) resolveInterlock(answer string) Model {
 		fmt.Sprintf("interlock: %s", answer))
 	m.interlock = nil
 	// Keep watchedStartCmdID set so pollWatchedStart sees it reach Done.
+	return m
+}
+
+// commitDurationModal validates the modal input and saves it to the model.
+// Empty / 0 / unparseable input clears the cap.
+func (m Model) commitDurationModal() Model {
+	if m.durationModal == nil {
+		return m
+	}
+	raw := m.durationModal.input
+	m.durationModal = nil
+	if raw == "" {
+		m.sessionDurationMins = 0
+		m.setBanner("ok", "duration cap cleared")
+		return m
+	}
+	mins, err := strconv.Atoi(raw)
+	if err != nil || mins < 0 {
+		m.setBanner("warn", "duration must be a non-negative integer")
+		return m
+	}
+	m.sessionDurationMins = mins
+	if mins == 0 {
+		m.setBanner("ok", "duration cap cleared")
+	} else {
+		m.setBanner("ok", fmt.Sprintf("duration cap set to %d min", mins))
+	}
 	return m
 }
 

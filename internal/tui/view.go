@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -9,6 +12,11 @@ import (
 
 	"github.com/foundersandcoders/media-pi/internal/state"
 )
+
+// partBadgeRe parses ffmpeg segment-muxer filenames so we can render a
+// "[part 03/05]" badge in the queue. Matches the `_part_NNN.mp4` suffix
+// produced by record.sh.
+var partBadgeRe = regexp.MustCompile(`_part_(\d+)\.mp4$`)
 
 // colour palette & styles — modest defaults; we can theme later.
 var (
@@ -50,7 +58,34 @@ func (m Model) View() string {
 	if m.interlock != nil {
 		return m.overlayInterlock(base)
 	}
+	if m.durationModal != nil {
+		return m.overlayDurationModal(base)
+	}
 	return base
+}
+
+func (m Model) overlayDurationModal(base string) string {
+	title := styleHeader.Render("set filming duration")
+	current := "currently: no cap"
+	if m.sessionDurationMins > 0 {
+		current = fmt.Sprintf("currently: %d min", m.sessionDurationMins)
+	}
+	body := fmt.Sprintf(
+		"%s\n\n"+
+			"Type total minutes for the next recording, then press enter.\n"+
+			"Empty (or 0) = no cap. esc to cancel.\n\n"+
+			"  > %s_",
+		styleDim.Render(current),
+		m.durationModal.input,
+	)
+	modal := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(1, 2).
+		Width(60).
+		Render(title + "\n\n" + body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
+		lipgloss.WithWhitespaceChars(" "))
 }
 
 func (m Model) overlayInterlock(base string) string {
@@ -86,10 +121,34 @@ func (m Model) renderHeader() string {
 		elapsed := time.Since(m.active.StartedAt).Truncate(time.Second)
 		status += "   recording: " + styleOK.Render(fmt.Sprintf("●") +
 			" " + humanElapsed(elapsed))
+		if total, uploaded := m.activeChunkCounts(); total > 0 {
+			status += "   " + styleDim.Render(
+				fmt.Sprintf("chunks: %d uploaded / %d so far", uploaded, total),
+			)
+		}
 	} else {
 		status += "   recording: " + styleDim.Render("idle")
 	}
 	return lipgloss.NewStyle().Padding(0, 1).Render(title + "   " + status)
+}
+
+// activeChunkCounts returns (total enqueued, total finished uploading) for the
+// current active recording. (0,0) if there's no active recording or no chunks
+// yet.
+func (m Model) activeChunkCounts() (total, uploaded int) {
+	if m.active == nil {
+		return 0, 0
+	}
+	for _, u := range m.uploads {
+		if !u.RecordingID.Valid || u.RecordingID.Int64 != m.active.ID {
+			continue
+		}
+		total++
+		if u.Status == state.UploadUploaded {
+			uploaded++
+		}
+	}
+	return total, uploaded
 }
 
 func (m Model) daemonStatus() string {
@@ -130,8 +189,9 @@ func (m Model) renderQueue(width int) string {
 		b.WriteString(styleDim.Render("(queue is empty)"))
 		return b.String()
 	}
+	chunkTotals := chunksPerRecording(m.uploads)
 	for i, u := range m.uploads {
-		line := formatQueueLine(u, width)
+		line := formatQueueLine(u, width, chunkTotals)
 		if i == m.selectedIdx {
 			line = styleSelected.Render(line)
 		}
@@ -141,7 +201,37 @@ func (m Model) renderQueue(width int) string {
 	return b.String()
 }
 
-func formatQueueLine(u state.Upload, width int) string {
+// chunksPerRecording counts how many uploads exist for each recording_id so
+// the queue can render a "[part NN/MM]" badge.
+func chunksPerRecording(ups []state.Upload) map[int64]int {
+	out := map[int64]int{}
+	for _, u := range ups {
+		if u.RecordingID.Valid {
+			out[u.RecordingID.Int64]++
+		}
+	}
+	return out
+}
+
+// partBadge returns a "[part NN/MM]" string for an upload that came from the
+// segment muxer, or "" if the file isn't a part_NNN.mp4 / lacks a recording_id.
+func partBadge(u state.Upload, totals map[int64]int) string {
+	m := partBadgeRe.FindStringSubmatch(filepath.Base(u.FilePath))
+	if m == nil {
+		return ""
+	}
+	if !u.RecordingID.Valid {
+		return ""
+	}
+	total, ok := totals[u.RecordingID.Int64]
+	if !ok || total == 0 {
+		return ""
+	}
+	n, _ := strconv.Atoi(m[1])
+	return fmt.Sprintf("[part %02d/%02d]", n, total)
+}
+
+func formatQueueLine(u state.Upload, width int, chunkTotals map[int64]int) string {
 	status := u.Status
 	switch u.Status {
 	case state.UploadUploaded:
@@ -153,8 +243,12 @@ func formatQueueLine(u state.Upload, width int) string {
 	case state.UploadPending:
 		status = styleDim.Render("• " + u.Status)
 	}
-	file := shortenPath(u.FilePath, width-30)
-	return fmt.Sprintf("%4d  %-24s  %s", u.ID, status, file)
+	badge := partBadge(u, chunkTotals)
+	// Reserve 12 chars for the badge column so files line up whether or not
+	// they're chunked.
+	badgeCol := fmt.Sprintf("%-12s", badge)
+	file := shortenPath(u.FilePath, width-42)
+	return fmt.Sprintf("%4d  %-24s  %s %s", u.ID, status, badgeCol, file)
 }
 
 func (m Model) renderLogs(width int) string {
@@ -181,8 +275,13 @@ func (m Model) renderLogs(width int) string {
 }
 
 func (m Model) renderFooter() string {
-	help := "[r] record   [s] stop   [R] retry failed   [↑/↓] select   [enter] refresh log   [q] quit"
+	help := "[r] record   [s] stop   [t] duration   [R] retry failed   [↑/↓] select   [enter] refresh log   [q] quit"
+	durationLine := "max duration: " + styleDim.Render("off")
+	if m.sessionDurationMins > 0 {
+		durationLine = "max duration: " + styleHeader.Render(fmt.Sprintf("%d min", m.sessionDurationMins))
+	}
 	var lines []string
+	lines = append(lines, durationLine)
 	if banner := m.activeBanner(); banner != "" {
 		lines = append(lines, banner)
 	}

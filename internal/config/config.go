@@ -24,6 +24,7 @@ type Config struct {
 	FACAPIKey                 string
 	UploadMaxAttempts         int
 	UploadBackoffStartSeconds int
+	SegmentTimeSeconds        int
 
 	// facpi-specific
 	FACPiID               string
@@ -67,6 +68,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.UploadBackoffStartSeconds, err = getIntDefault("UPLOAD_BACKOFF_START_SECONDS", 1); err != nil {
+		return c, err
+	}
+	if c.SegmentTimeSeconds, err = getIntDefault("SEGMENT_TIME_SECONDS", 800); err != nil {
 		return c, err
 	}
 	if c.SchedulePollInterval, err = getDurationSecondsDefault("SCHEDULE_POLL_INTERVAL_SECONDS", 60); err != nil {
